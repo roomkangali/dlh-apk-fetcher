@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Iterable, Sequence
 
 import click
@@ -24,6 +27,15 @@ LOGS_DIR = APP_DIR / "logs"
 LOG_FILE = LOGS_DIR / "app.log"
 
 console = Console()
+
+# Thread-safe print lock for parallel metadata fetching
+_print_lock = Lock()
+
+
+def _safe_print(*args: object, **kwargs: object) -> None:
+    """Thread-safe console print."""
+    with _print_lock:
+        console.print(*args, **kwargs)
 
 
 class APKDownloaderError(Exception):
@@ -65,6 +77,15 @@ class APKEntry:
     def display_name(self) -> str:
         """Return the base filename for display purposes."""
         return Path(self.remote_path).name
+
+
+@dataclass(slots=True)
+class PackageInfo:
+    """Represents an installed package with application metadata."""
+
+    name: str
+    app_name: str = ""
+    version: str = ""
 
 
 def setup_directories() -> None:
@@ -228,32 +249,155 @@ class DeviceManager:
 class PackageManager:
     """Handles package listing, searching, and APK path lookup."""
 
+    # Precompiled regex patterns for label/version extraction (from b.py approach)
+    _LABEL_RE = re.compile(r"label=([\w\s\-\'’\(\)&]+)")
+    _LABEL_FALLBACK_RE = re.compile(r"labels=\(?\[(.*?)\]\)?\s")
+    _VERSION_RE = re.compile(r"versionName=(.+)")
+
     def __init__(self, adb_manager: ADBManager, device_manager: DeviceManager) -> None:
         self.adb_manager = adb_manager
         self.device_manager = device_manager
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def list_packages(self) -> list[str]:
-        """List installed packages on the selected device."""
+    # ------------------------------------------------------------------
+    # Parallel per-package metadata fetch
+    # ------------------------------------------------------------------
+    def _fetch_one_package(self, package_name: str) -> PackageInfo:
+        """Fetch app label + version for a single package.
+
+        Uses the proven approach from b.py: query-intent-activities for label,
+        dumpsys package for version + labels fallback.
+        Runs inside a ThreadPoolExecutor worker thread.
+        """
         serial = self.device_manager.get_selected_serial()
+        app_name = ""
+        version = ""
+
+        # --- Step 1: Label via query-intent-activities (b.py method 1) ---
+        try:
+            query_cmd = (
+                "cmd package query-intent-activities --activity-blank-component"
+                " -a android.intent.action.MAIN"
+                " -c android.intent.category.LAUNCHER"
+                f" {package_name}"
+            )
+            r = self.adb_manager.run_command(
+                ["adb", "shell", query_cmd], device_serial=serial,
+            )
+            m = self._LABEL_RE.search(r.stdout)
+            if m:
+                app_name = m.group(1).strip()
+        except APKDownloaderError:
+            pass
+
+        # --- Step 2: dumpsys package (for version, and labels fallback) ---
+        try:
+            r = self.adb_manager.run_command(
+                ["adb", "shell", "dumpsys", "package", package_name],
+                device_serial=serial,
+            )
+            stdout = r.stdout
+
+            # Version
+            vm = self._VERSION_RE.search(stdout)
+            if vm:
+                version = vm.group(1).strip()
+
+            # Label fallback via dumpsys labels=[...]
+            if not app_name:
+                fm = self._LABEL_FALLBACK_RE.search(stdout)
+                if fm and fm.group(1):
+                    app_name = fm.group(1).split(",")[0].strip()
+        except APKDownloaderError:
+            pass
+
+        # --- Step 3: Final fallback — clean package name ---
+        if not app_name:
+            clean = package_name.split(".")[-1]
+            app_name = clean.capitalize() if clean else package_name
+
+        return PackageInfo(name=package_name, app_name=app_name, version=version)
+
+    def _parallel_fetch_all(
+        self, package_names: list[str], *, workers: int = 20
+    ) -> list[PackageInfo]:
+        """Fetch metadata for all packages in parallel using ThreadPoolExecutor."""
+        total = len(package_names)
+        name_to_idx = {n: i for i, n in enumerate(package_names)}
+        results: list[PackageInfo] = [
+            PackageInfo(name=n) for n in package_names
+        ]
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+        )
+
+        with progress:
+            task_id = progress.add_task(
+                "Fetching app names and versions...", total=total
+            )
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(self._fetch_one_package, name): name
+                    for name in package_names
+                }
+                for future in as_completed(futures):
+                    try:
+                        pkg = future.result()
+                        idx = name_to_idx[pkg.name]
+                        results[idx] = pkg
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Failed to fetch metadata: %s", exc
+                        )
+                    progress.advance(task_id)
+
+        labeled = sum(1 for p in results if p.app_name)
+        self.logger.info(
+            "Parallel fetch done: %d/%d packages have labels", labeled, total
+        )
+        return results
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def list_packages(self) -> list[PackageInfo]:
+        """List installed packages with application name and version.
+
+        Fetches labels + versions in parallel (~16 workers) for speed.
+        """
+        serial = self.device_manager.get_selected_serial()
+
+        # 1. Fast: get raw package names
         result = self.adb_manager.run_command(
             ["adb", "shell", "pm", "list", "packages"],
             device_serial=serial,
         )
-
-        packages = sorted(
+        package_names = sorted(
             line.replace("package:", "").strip()
             for line in result.stdout.splitlines()
             if line.strip().startswith("package:")
         )
 
-        self.logger.info("Loaded %s package(s)", len(packages))
+        total = len(package_names)
+        self.logger.info("Loaded %d package names, fetching metadata...", total)
+
+        # 2. Parallel per-package fetch with progress bar
+        packages = self._parallel_fetch_all(package_names)
+
+        self.logger.info("Final: %d packages ready", len(packages))
         return packages
 
-    def list_running_packages(self) -> list[str]:
+    def list_running_packages(self) -> list[PackageInfo]:
         """List installed packages that currently have a running process."""
         serial = self.device_manager.get_selected_serial()
-        installed_packages = self.list_packages()
+        all_packages = self.list_packages()
+        installed_names = {pkg.name for pkg in all_packages}
 
         commands_to_try = [
             ["adb", "shell", "ps"],
@@ -278,42 +422,56 @@ class PackageManager:
             if process_names:
                 break
 
-        running_packages: set[str] = set()
-        installed_package_set = set(installed_packages)
-
+        running_package_names: set[str] = set()
         for process_name in process_names:
             candidates = [process_name]
             if ":" in process_name:
                 candidates.append(process_name.split(":", 1)[0])
 
             for candidate in candidates:
-                if candidate in installed_package_set:
-                    running_packages.add(candidate)
+                if candidate in installed_names:
+                    running_package_names.add(candidate)
 
-        packages = sorted(running_packages)
-        self.logger.info("Loaded %s running package(s)", len(packages))
+        packages = sorted(
+            (pkg for pkg in all_packages if pkg.name in running_package_names),
+            key=lambda p: p.name,
+        )
+        self.logger.info("Loaded %d running package(s)", len(packages))
         return packages
 
-    def search_packages(self, query: str, packages: Iterable[str] | None = None) -> list[str]:
-        """Search packages by substring match."""
+    def search_packages(
+        self, query: str, packages: Iterable[PackageInfo] | None = None
+    ) -> list[PackageInfo]:
+        """Search packages by substring match on package name OR app name."""
         package_list = list(packages) if packages is not None else self.list_packages()
         query_normalized = query.strip().lower()
         if not query_normalized:
             return package_list
-        return [package for package in package_list if query_normalized in package.lower()]
+        return [
+            pkg
+            for pkg in package_list
+            if query_normalized in pkg.name.lower()
+            or query_normalized in pkg.app_name.lower()
+        ]
 
-    def display_packages(self, packages: Sequence[str], title: str = "Installed Applications") -> None:
-        """Display packages in a rich table."""
+    def display_packages(
+        self, packages: Sequence[PackageInfo], title: str = "Installed Applications"
+    ) -> None:
+        """Display packages in a rich table with app name and version."""
         table = Table(title=title, header_style="bold magenta")
         table.add_column("No", style="bold", width=6)
         table.add_column("Package Name", style="green")
+        table.add_column("Application Name", style="cyan")
+        table.add_column("Version", style="yellow")
 
-        for index, package in enumerate(packages, start=1):
-            table.add_row(str(index), package)
+        for index, pkg in enumerate(packages, start=1):
+            app_name = pkg.app_name or "-"
+            version = pkg.version or "-"
+            table.add_row(str(index), pkg.name, app_name, version)
 
         console.print(table)
 
-    def select_package(self, packages: Sequence[str], user_input: str) -> str:
+    def select_package(self, packages: Sequence[PackageInfo], user_input: str) -> str:
         """Select a package by index or exact package name."""
         candidate = user_input.strip()
         if not candidate:
@@ -322,11 +480,12 @@ class PackageManager:
         if candidate.isdigit():
             index = int(candidate) - 1
             if 0 <= index < len(packages):
-                return packages[index]
+                return packages[index].name
             raise PackageError("Invalid package number.")
 
-        if candidate in packages:
-            return candidate
+        for pkg in packages:
+            if candidate == pkg.name:
+                return pkg.name
 
         raise PackageError("Package not found.")
 
@@ -355,10 +514,15 @@ class PackageManager:
         self.logger.info("Found %s APK file(s) for %s", len(entries), package_name)
         return entries
 
-    def export_packages(self, packages: Sequence[str], output_file: Path) -> Path:
-        """Export package list to a text file."""
+    def export_packages(
+        self, packages: Sequence[PackageInfo], output_file: Path
+    ) -> Path:
+        """Export package list to a tab-separated text file with metadata."""
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        output_file.write_text("\n".join(packages) + "\n", encoding="utf-8")
+        lines: list[str] = ["Package Name\tApplication Name\tVersion"]
+        for pkg in packages:
+            lines.append(f"{pkg.name}\t{pkg.app_name or '-'}\t{pkg.version or '-'}")
+        output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.logger.info("Exported package list to %s", output_file)
         return output_file
 
@@ -420,7 +584,7 @@ class CLI:
         self.package_manager = PackageManager(self.adb_manager, self.device_manager)
         self.downloader = Downloader(self.adb_manager, self.device_manager)
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.cached_packages: list[str] = []
+        self.cached_packages: list[PackageInfo] = []
 
     def run(self) -> None:
         """Run the interactive CLI application."""
@@ -435,14 +599,9 @@ class CLI:
             self.logger.exception("Application error: %s", exc)
             sys.exit(1)
 
-    def load_packages(self) -> list[str]:
-        """Load all installed packages."""
+    def load_packages(self) -> list[PackageInfo]:
+        """Load all installed packages with metadata."""
         self.cached_packages = self.package_manager.list_packages()
-        return self.cached_packages
-
-    def load_running_packages(self) -> list[str]:
-        """Load only running packages."""
-        self.cached_packages = self.package_manager.list_running_packages()
         return self.cached_packages
 
     def initialize(self) -> None:
@@ -506,25 +665,62 @@ class CLI:
                 break
 
     def handle_list_packages(self) -> None:
-        """Display all installed packages."""
-        self.load_packages()
+        """Display all installed packages (uses cache)."""
+        if not self.cached_packages:
+            self.load_packages()
         self.package_manager.display_packages(
             self.cached_packages,
             title=f"Installed Applications ({len(self.cached_packages)})",
         )
 
     def handle_list_running_packages(self) -> None:
-        """Display only running applications."""
-        self.load_running_packages()
+        """Display only running applications (reuses cached metadata)."""
+        if not self.cached_packages:
+            self.load_packages()
+
+        serial = self.device_manager.get_selected_serial()
+        installed_names = {pkg.name for pkg in self.cached_packages}
+
+        commands_to_try = [["adb", "shell", "ps"], ["adb", "shell", "ps", "-A"]]
+        process_names: set[str] = set()
+        for command in commands_to_try:
+            try:
+                result = self.adb_manager.run_command(command, device_serial=serial)
+            except APKDownloaderError:
+                continue
+            for line in result.stdout.splitlines()[1:]:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if parts:
+                    process_names.add(parts[-1])
+            if process_names:
+                break
+
+        running_names: set[str] = set()
+        for pn in process_names:
+            candidates = [pn]
+            if ":" in pn:
+                candidates.append(pn.split(":", 1)[0])
+            for c in candidates:
+                if c in installed_names:
+                    running_names.add(c)
+
+        running_packages = sorted(
+            (p for p in self.cached_packages if p.name in running_names),
+            key=lambda p: p.name,
+        )
         self.package_manager.display_packages(
-            self.cached_packages,
-            title=f"Running Applications ({len(self.cached_packages)})",
+            running_packages,
+            title=f"Running Applications ({len(running_packages)})",
         )
 
     def handle_search_packages(self) -> None:
-        """Search for packages and display the result."""
+        """Search for packages and display the result (uses cache)."""
         query = click.prompt("Search package", type=str, default="", show_default=False)
-        self.load_packages()
+        if not self.cached_packages:
+            self.load_packages()
         results = self.package_manager.search_packages(query, self.cached_packages)
 
         if not results:
@@ -534,8 +730,9 @@ class CLI:
         self.package_manager.display_packages(results, title=f"Search Results ({len(results)})")
 
     def handle_download(self) -> None:
-        """Handle APK selection and download flow."""
-        self.load_packages()
+        """Handle APK selection and download flow (uses cache)."""
+        if not self.cached_packages:
+            self.load_packages()
         query = click.prompt(
             "Search package (leave blank to show all)",
             type=str,

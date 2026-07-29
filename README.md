@@ -7,7 +7,7 @@
 </p>
 
 
-A Python CLI application for detecting Android devices connected through ADB, listing installed applications, showing currently running applications, searching package names, and downloading APK files into a structured local folder.
+A Python CLI application for detecting Android devices connected through ADB, listing installed applications with names and versions, showing currently running applications, searching packages, and downloading APK files into a structured local folder.
 
 This tool is designed to help prepare APK samples for further Android security analysis, especially when working with **Droid LLM Hunter**.
 
@@ -21,7 +21,7 @@ Repository:
 Before an APK can be analyzed by Droid LLM Hunter, it first needs to be collected from a real device or emulator. **dlh-apk-fetcher** helps with that step by:
 
 - detecting connected Android devices via ADB
-- listing installed applications
+- listing installed applications **with real application names and version info**
 - showing applications that are currently running
 - locating APK paths on the device
 - downloading base APK and split APK files
@@ -30,7 +30,7 @@ Before an APK can be analyzed by Droid LLM Hunter, it first needs to be collecte
 This makes it easier to extract APKs from test devices and move them into a workflow for static analysis, reverse engineering, or vulnerability scanning with Droid LLM Hunter.
 
 <p align="center">
-  <img src="main.png" width="750">
+  <img src="daf.png" width="750">
 </p>
 
 ## Features
@@ -38,14 +38,16 @@ This makes it easier to extract APKs from test devices and move them into a work
 - Check whether `adb` is available on the system
 - Detect connected Android devices or emulators
 - Let the user choose a device if multiple devices are connected
-- List all installed application packages
-- List currently running application packages
-- Search packages quickly by keyword
+- List all installed application packages with **application name** and **version**
+- List currently running application packages with metadata
+- Search packages quickly by keyword (searches both package name and application name)
 - Select an application by number or package name
 - Support **Split APK**
 - Download all APK files related to the selected package
 - Store downloads inside a dedicated folder per package
-- Export the package list to a `.txt` file
+- **Parallel metadata fetching** — 20 concurrent ADB calls for fast startup (~2–3 seconds for 260 apps)
+- **Smart caching** — metadata loaded once, reused across all menu options
+- Export the package list to a tab-separated `.txt` file (with app name + version)
 - Save logs to `logs/app.log`
 - Professional CLI interface using `rich`
 - Works on Windows, Linux, and macOS as long as `adb` is available in `PATH`
@@ -71,7 +73,7 @@ cd dlh-apk-fetcher
 Linux/macOS:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv venv
 source .venv/bin/activate
 ```
 
@@ -143,7 +145,7 @@ When the application starts, it will:
 1. Check whether `adb` is available
 2. Detect connected devices
 3. Ask the user to select a device if multiple devices are available
-4. Load installed packages
+4. Load all installed packages in parallel with progress bar
 5. Show the main menu
 
 Main menu:
@@ -168,7 +170,20 @@ Choose:
 1
 ```
 
-The application will display installed packages sorted alphabetically.
+The application will display installed packages sorted alphabetically with **Application Name** and **Version** columns:
+
+```text
+                                 Installed Applications (260)                                 
+┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ No     ┃ Package Name                 ┃ Application Name ┃ Version                       ┃
+┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ 1      │ com.android.chrome           │ Chrome           │ 145.0.7632.76                 │
+│ 2      │ com.android.vending          │ Vending          │ 50.3.27-31                    │
+│ 3      │ com.google.android.gm        │ Gm               │ 2026.02.09.871532558.Release  │
+│ 4      │ com.google.android.youtube   │ Youtube          │ 21.07.243                     │
+│ ...    │ ...                          │ ...              │ ...                           │
+└────────┴──────────────────────────────┴──────────────────┴───────────────────────────────┘
+```
 
 ### 2. List running applications
 
@@ -178,7 +193,7 @@ Choose:
 2
 ```
 
-This shows only applications that currently have active processes on the Android device.
+This shows only applications that currently have active processes on the Android device — with instant response since it reuses cached metadata (no re-fetch).
 
 ### 3. Search applications
 
@@ -191,8 +206,10 @@ Choose:
 Then enter a keyword, for example:
 
 ```text
-whats
+chrome
 ```
+
+Searches across both **package name** and **application name**, so you can search by either.
 
 ### 4. Download APK files
 
@@ -208,7 +225,7 @@ Then:
 - or enter the package name directly, for example:
 
 ```text
-com.google.android.apps.labs.language.tailwind
+com.android.chrome
 ```
 
 If the application uses split APKs, all related APK files will be downloaded.
@@ -217,10 +234,14 @@ Downloaded files are stored in a dedicated package folder, for example:
 
 ```text
 downloads/
-└── com.google.android.apps.labs.language.tailwind/
-    ├── com_google_android_apps_labs_language_tailwind_base.apk
-    ├── com_google_android_apps_labs_language_tailwind_split_config.x86_64.apk
-    └── com_google_android_apps_labs_language_tailwind_split_config.xxhdpi.apk
+└── com.android.chrome
+    ├── com_android_chrome_base.apk
+    ├── com_android_chrome_split_chrome.apk
+    ├── com_android_chrome_split_config.en.apk
+    ├── com_android_chrome_split_dev_ui.apk
+    ├── com_android_chrome_split_on_demand.apk
+    ├── com_android_chrome_split_stack_unwinder.apk
+    └── com_android_chrome_split_test_dummy.apk
 ```
 
 ### 5. Export package list
@@ -231,11 +252,13 @@ Choose:
 6
 ```
 
-The package list will be saved to:
+The package list will be saved as a tab-separated file at:
 
 ```text
 downloads/packages.txt
 ```
+
+With columns: `Package Name`, `Application Name`, and `Version`.
 
 ## Using the APKs with Droid LLM Hunter
 
@@ -302,47 +325,9 @@ adb start-server
 adb devices
 ```
 
-### Package not found
+### Slow startup / metadata fetching
 
-Solution:
-- Check the package name again
-- Use the search feature
-- Make sure the application is installed on the selected device
-
-### Failed to download APK
-
-Solution:
-- Make sure the APK path is accessible through ADB
-- Make sure the device connection is stable
-- Check for permission-related issues
-- Review the log file at `logs/app.log`
-
-### Permission denied
-
-Solution:
-- Run the terminal with the required permissions
-- Check write permissions for the project folder
-- Make sure the APK path can be accessed through `adb pull`
-
-## Logging
-
-Important events and errors are saved to:
-
-```text
-logs/app.log
-```
-
-Logs are useful for debugging when:
-- ADB commands fail
-- device communication has issues
-- packages cannot be found
-- APK downloads fail
-
-## Implementation Notes
-
-This application uses:
-- `click` for CLI input
-- `rich` for terminal output
-- `subprocess` for ADB command execution
-- structured exception handling
-- type hints and docstrings
+If the initial metadata fetch is slow:
+- Make sure the ADB connection is stable (USB preferred over Wi-Fi)
+- Reduce worker count if your system has limited resources (edit `workers=` in `_parallel_fetch_all`)
+- Emulators may be slower than physical devices
