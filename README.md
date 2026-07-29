@@ -1,5 +1,12 @@
 # DLH Apk Fetcher
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Security-Android-green" />
+  <img src="https://img.shields.io/badge/Apk Fetcher-DLH-red" />
+  <img src="https://img.shields.io/badge/version-1.1.0-cyan" />
+</p>
+
+
 A Python CLI application for detecting Android devices connected through ADB, listing installed applications, showing currently running applications, searching package names, and downloading APK files into a structured local folder.
 
 This tool is designed to help prepare APK samples for further Android security analysis, especially when working with **Droid LLM Hunter**.
