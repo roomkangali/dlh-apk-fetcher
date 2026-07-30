@@ -39,7 +39,7 @@ def _safe_print(*args: object, **kwargs: object) -> None:
 
 
 class APKDownloaderError(Exception):
-    """Base exception for the APK downloader application."""
+    """Base exception for the DLH Apk Fetcher application."""
 
 
 class ADBNotFoundError(APKDownloaderError):
@@ -58,12 +58,14 @@ class DownloadError(APKDownloaderError):
     """Raised when APK download fails."""
 
 
-@dataclass(slots=True)
+@dataclass
 class Device:
     """Represents a connected Android device."""
 
     serial: str
-    state: str
+    state: str = "device"
+    model: str = ""
+    android_version: str = ""
 
 
 @dataclass(slots=True)
@@ -244,6 +246,29 @@ class DeviceManager:
         """Return the selected device serial."""
         device = self._selected_device or self.ensure_device_selected()
         return device.serial
+
+    def get_device_info(self) -> Device:
+        """Fetch device model name and Android version via getprop."""
+        device = self._selected_device or self.ensure_device_selected()
+        serial = device.serial
+        try:
+            r = self.adb_manager.run_command(
+                ["adb", "shell", "getprop", "ro.product.model"],
+                device_serial=serial,
+            )
+            device.model = r.stdout.strip()
+        except APKDownloaderError:
+            self.logger.warning("Failed to get device model")
+        try:
+            r = self.adb_manager.run_command(
+                ["adb", "shell", "getprop", "ro.build.version.release"],
+                device_serial=serial,
+            )
+            device.android_version = r.stdout.strip()
+        except APKDownloaderError:
+            self.logger.warning("Failed to get Android version")
+        self._selected_device = device
+        return device
 
 
 class PackageManager:
@@ -607,13 +632,16 @@ class CLI:
     def initialize(self) -> None:
         """Initialize ADB and device state."""
         self.adb_manager.check_adb_installed()
-        device = self.device_manager.ensure_device_selected()
+        self.device_manager.ensure_device_selected()
+        device = self.device_manager.get_device_info()
         self.load_packages()
         console.print(
             Panel.fit(
                 (
-                    "[bold cyan]APK Downloader via ADB[/bold cyan]\n\n"
+                    "[bold cyan]DLH Apk Fetcher via ADB[/bold cyan]\n\n"
                     f"Device: [green]{device.serial}[/green]\n"
+                    f"Model: [green]{device.model or 'Unknown'}[/green]\n"
+                    f"Android Version: [green]{device.android_version or 'Unknown'}[/green]\n"
                     f"Total apps: [yellow]{len(self.cached_packages)}[/yellow]"
                 ),
                 border_style="cyan",
@@ -623,10 +651,13 @@ class CLI:
     def refresh(self) -> None:
         """Refresh device and package data."""
         device = self.device_manager.ensure_device_selected()
+        device = self.device_manager.get_device_info()
         self.load_packages()
         console.print(
-            f"[green]Active device:[/green] {device.serial} | "
-            f"[green]Total apps:[/green] {len(self.cached_packages)}"
+            f"[green]Device:[/green] {device.serial} | "
+            f"[green]Model:[/green] {device.model or 'Unknown'} | "
+            f"[green]Android:[/green] {device.android_version or 'Unknown'} | "
+            f"[green]Apps:[/green] {len(self.cached_packages)}"
         )
 
     def main_menu(self) -> None:
@@ -641,7 +672,7 @@ class CLI:
                     "5. Refresh device\n"
                     "6. Export package list\n"
                     "7. Exit",
-                    title="APK Downloader",
+                    title="DLH Apk Fetcher",
                     border_style="blue",
                 )
             )
@@ -768,7 +799,7 @@ class CLI:
 
 @click.command()
 def main() -> None:
-    """Entrypoint for the APK Downloader CLI."""
+    """Entrypoint for the DLH Apk Fetcher CLI."""
     cli = CLI()
     cli.run()
 
